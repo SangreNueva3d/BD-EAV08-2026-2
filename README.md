@@ -140,6 +140,11 @@ cliente, cuenta o transacción repetida entre filas.
 
 ---
 
+# Criterio 4- Modelo Fisico
+
+Ver [`schema.sql`](./schema.sql)
+
+1 Versión
 
 
 
