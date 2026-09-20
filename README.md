@@ -106,7 +106,9 @@ erDiagram
 - Una transacción tiene uno o muchos eventos de auditoría; un evento pertenece a una y solo una transacción.
 - Un cliente puede tener cero o muchos reportes generados; un reporte pertenece a uno y solo un cliente.
 
-## 2. Preguntas clave de negocio
+---
+
+# Criterio 2- Preguntas clave de negocio
 
 | # | Pregunta | Tipo de consulta |
 |---|---|---|
@@ -115,6 +117,31 @@ erDiagram
 | 3 | ¿Cuál es la tasa de rechazo de transacciones por comercio, en un rango de fechas dado? | Agregación + filtro |
 | 4 | ¿Cuál es el historial completo de eventos (cambios de estado) de una transacción específica? | Join |
 | 5 | ¿Qué comercios están activos pero no tienen ninguna cuenta bancaria vinculada en estado "activa"? | Filtro + join (antijoin) |
+
+
+---
+
+# Criterio 3- Modelo lógico
+
+
+
+Todas las tablas están normalizadas a 3FN/BCNF: cada atributo no clave depende de forma
+completa y no transitiva de la clave primaria de su tabla, y no hay redundancia de datos de
+cliente, cuenta o transacción repetida entre filas.
+
+| Tabla | Clave primaria | Claves foráneas | Notas |
+|---|---|---|---|
+| `clientes` | `id_cliente` | — | `nit_documento` y `email` son claves candidatas (UNIQUE) |
+| `cuentas_bancarias` | `id_cuenta` | `id_cliente` → `clientes` | `(banco, numero_cuenta)` UNIQUE |
+| `credenciales_api` | `id_credencial` | `id_cliente` → `clientes` | `api_key` UNIQUE |
+| `transacciones` | `id_transaccion` | `id_cliente` → `clientes`; `id_cuenta_origen`, `id_cuenta_destino` → `cuentas_bancarias` | `referencia_externa` UNIQUE (idempotencia) |
+| `eventos_transaccion` | `id_evento` | `id_transaccion` → `transacciones` | Entidad débil respecto a `transacciones` |
+| `reportes` | `id_reporte` | `id_cliente` → `clientes` | `contenido` en JSONB para el resumen agregado |
+
+---
+
+
+
 
 
 
