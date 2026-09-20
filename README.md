@@ -123,7 +123,7 @@ erDiagram
 
 # Criterio 3- Modelo lógico
 
-
+![Diagrama ERD](Diagramas/ERD.jpg)
 
 Todas las tablas están normalizadas a 3FN/BCNF: cada atributo no clave depende de forma
 completa y no transitiva de la clave primaria de su tabla, y no hay redundancia de datos de
