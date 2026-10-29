@@ -281,6 +281,7 @@ Ver [`schema.sql`](./schema.sql)
 ---
 
 # Criterio 4- Consultas de los dos primeros sprints 
+
 | # | Sprint | Pregunta | Tipo de consulta | Cómo se resuelve |
 |---|---|---|---|---|
 | 1 | 1 | ¿Cuáles son los 10 comercios con mayor volumen de transacciones **aprobadas** en el último mes? | Filtro + agregación | `WHERE estado='aprobado' AND fecha` del mes, `GROUP BY` comercio, `SUM(monto)`, `ORDER BY` desc, `LIMIT 10` |
@@ -376,6 +377,55 @@ ORDER BY cambios_realizados DESC;
 ```
 
 ---
+# Criterio 5 -  Estimación de volumen
+
+Supuestos de negocio (plataforma B2B de pagos, adopción moderada en el primer año):
+
+- 300 comercios registrados al cierre del primer trimestre, con una adquisición neta del 8%
+  mensual durante el primer año.
+- Cada comercio mantiene en promedio 1.3 cuentas 
+- Cada comercio genera en promedio 2 credenciales de API activas 
+- Un comercio activo procesa en promedio 40 transacciones/día una vez integrado.
+- Cada transacción genera en promedio 3 eventos de auditoría (creación, cambio de estado,
+  notificación de webhook).
+- Se genera 1 reporte mensual por comercio activo.
+
+| Tabla | Registros iniciales (fin Q1) | Crecimiento esperado | Proyección a 12 meses |
+|---|---|---|---|
+| `clientes` | 300 | +8% mensual (~24 comercios nuevos/mes) | ~720 |
+| `cuentas` | ~390 (300 × 1.3) | proporcional a `clientes` | ~940 |
+| `credenciales_api` | ~600 (300 × 2) | proporcional a `clientes` | ~1.440 |
+| `transacciones` | ~360.000/mes (300 × 40 × 30) | +8% mensual junto con la base de comercios | ~860.000/mes al mes 12 |
+| `eventos_transaccion` | ~1.080.000/mes (3 × transacciones) | igual que `transacciones` | ~2,6 M/mes al mes 12 |
+| `reportes` | 300/mes | proporcional a `clientes` | ~720/mes |
+
+`transacciones` y `eventos_transaccion` son, por volumen, las tablas que más presión ponen sobre
+almacenamiento e índices — son las candidatas naturales para un futuro análisis de ese tipo a
+mayor escala (el análisis del criterio 7 en `docs/analisis-almacenamiento.md` se hizo sobre
+`cuentas`, por ser una de las tablas ya implementadas).
+
+---
+---
+# Criterio 6 - Roles y esquema de seguridad
+
+Principio de mínimo privilegio: cada rol recibe solo lo que necesita para su función. El `rol`
+de la tabla `clientes` (`CLIENTE` / `ADMINISTRADOR`) es lógica de negocio dentro de la
+aplicación; estos roles de PostgreSQL son un control adicional a nivel de motor de base de
+datos, independiente del anterior.
+
+### Matriz rol × permisos
+
+| Tabla | `rol_admin` | `rol_app` | `rol_lectura` |
+|---|---|---|---|
+| `clientes` | ALL | SELECT, INSERT, UPDATE | SELECT |
+| `cuentas` | ALL | SELECT, INSERT, UPDATE | SELECT |
+| `credenciales_api` | ALL | SELECT, INSERT, UPDATE | — (datos sensibles: sin acceso de solo lectura) |
+| `transacciones` | ALL | SELECT, INSERT, UPDATE | SELECT |
+| `eventos_transaccion` | ALL | SELECT, INSERT (sin UPDATE: es un log de auditoría inmutable) | SELECT |
+| `reportes` | ALL | SELECT, INSERT | SELECT |
+
+---
+# CRITERIOS 7 Y 8 EN EL OTRO ARCHIVO .MD
 
 
 2 Versión
