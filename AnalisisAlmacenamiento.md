@@ -108,6 +108,106 @@ saldo, que son las más frecuentes del sistema.
 
 # Criterio 8 — Costo de una consulta con reunión (join)
 
+### Consulta analizada
+
+Responde la pregunta clave 8 del README ("¿cuál es el saldo total agregado por comercio,
+sumando sus cuentas activas?"):
+
+```sql
+SELECT c.nombre_comercial, SUM(cu.saldo) AS saldo_total
+FROM clientes c
+JOIN cuentas cu ON cu.id_cliente = c.id_cliente
+WHERE cu.estado = 'activo'
+GROUP BY c.nombre_comercial;
+```
+
+### Estadísticas usadas y su origen
+
+`cuentas` ya se calculó en el criterio 7. Para `clientes` se repite el mismo método 
+
+| Columna | Clasificación | Tamaño |
+|---|---|---|
+| `id_cliente` | Fijo | 16 |
+| `fecha_registro` | Fijo | 8 |
+| `actualizado_por` | Fijo | 16 |
+| `fecha_actualizacion` | Fijo | 8 |
+| `intentos_fallidos` | Fijo | 4 |
+| `bloqueado_hasta` | Fijo | 8 |
+| `nombre_comercial`, `razon_social`, `nit_documento`, `email`, `usuario`, `contrasena`, `telefono`, `estado`, `rol`, `motivo` | Variables (10 campos) | 25+35+12+28+15+60+10+7+8+3 = 203 |
+
+`contrasena` se estima en 60 bytes exactos porque BCrypt produce hashes de longitud fija
+(60 caracteres), no un valor arbitrario.
+
+```
+Σ fijos = 16+8+16+8+4+8 = 60 bytes
+4·#var = 4·10 = 40 bytes
+mapa de bits = ⌈16 columnas / 8⌉ = 2 bytes
+L_clientes = 40 + 60 + 2 + 203 = 305 bytes
+
+FR_clientes = ⌊(8192−2)/(4+305)⌋ = ⌊8190/309⌋ = 26 registros/página
+BR_clientes = ⌈720 / 26⌉ = 28 páginas   (TR=720, proyección a 12 meses, sección 5 del README)
+```
+
+Resumen de estadísticas para el join:
+
+| Relación | TR (tuplas) | BR (páginas) |
+|---|---|---|
+| `clientes` (R) | 720 | 28 |
+| `cuentas` (S) | 940 | 11 |
+
+Memoria disponible asumida: **M = 15 páginas** (buffer modesto, razonable para un servicio
+desplegado en el plan gratuito de Render, que comparte recursos con otros procesos).
+
+### Fórmula aplicada y por qué
+
+El predicado de unión (`id_cliente`) no es selectivo por sí solo (no hay filtro de igualdad
+sobre un valor puntual), así que se evalúan las tres estrategias de reunión de la rúbrica para
+elegir la más barata: **nested-loop por bloques**, **nested-loop indexado** y **hash join**.
+
+**1) Nested-loop por bloques** — `Costo = BR + BS · ⌈BR/(M−2)⌉` (conviene poner como relación
+externa la más pequeña en páginas):
+
+```
+cuentas como externa:  BS + BR·⌈BS/(M−2)⌉ = 11 + 28·⌈11/13⌉ = 11 + 28·1 = 39 páginas
+clientes como externa: BR + BS·⌈BR/(M−2)⌉ = 28 + 11·⌈28/13⌉ = 28 + 11·3 = 61 páginas
+```
+
+Poner `cuentas` (la relación más pequeña) como externa reduce el costo de 61 a 39 páginas.
+
+**2) Nested-loop indexado** — `Costo = BT + TT · S(b,R)`, usando `cuentas` como relación
+externa (BT=11, TT=940) y sondeando el índice de la **clave primaria** de `clientes`:
+
+```
+S(id_cliente, clientes) = TR_clientes / V(id_cliente,clientes) = 720/720 = 1
+Costo = 11 + 940·1 = 951 páginas
+```
+
+Sale caro porque el costo de este método depende del número de **tuplas** de la relación
+externa (940), no de sus páginas — y `cuentas` es una tabla "densa" (86 registros/página), así
+que hay muchas sondas de índice redundantes.
+
+**3) Hash join (en memoria)** — `Costo = BR + BS` (válido porque M=15 páginas alcanza para
+construir la tabla hash de la relación más pequeña, `cuentas`, con 11 páginas):
+
+```
+Costo = 28 + 11 = 39 páginas
+```
+
+### Comparación y conclusión
+
+| Estrategia | Costo (páginas de E/S) |
+|---|---|
+| Nested-loop por bloques (`cuentas` externa) | 39 |
+| Nested-loop por bloques (`clientes` externa) | 61 |
+| Nested-loop indexado | 951 |
+| **Hash join** | **39** |
+
+El **hash join es la elección recomendada**: su costo no depende de cómo se ordene R y S, es
+estable frente al crecimiento de ambas tablas, y es, de hecho, la estrategia que el planificador
+de PostgreSQL elegiría en la práctica para una reunión por igualdad sin un filtro selectivo de
+por medio.
+
+
 
 # Criterio 9 — Optimización algebraica de la misma consulta
 
