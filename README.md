@@ -425,7 +425,7 @@ datos, independiente del anterior.
 | `reportes` | ALL | SELECT, INSERT | SELECT |
 
 ---
-# CRITERIOS 7 Y 8 EN EL OTRO ARCHIVO .MD
+# CRITERIOS 7, 8 y 9 EN EL OTRO ARCHIVO .MD
 
 
 2 Versión
