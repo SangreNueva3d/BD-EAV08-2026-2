@@ -211,3 +211,86 @@ por medio.
 
 # Criterio 9 — Optimización algebraica de la misma consulta
 
+### SQL original
+
+```sql
+SELECT c.nombre_comercial, SUM(cu.saldo) AS saldo_total
+FROM clientes c
+JOIN cuentas cu ON cu.id_cliente = c.id_cliente
+WHERE cu.estado = 'activo'
+GROUP BY c.nombre_comercial;
+```
+
+### Expresión algebraica inicial (traducción literal del SQL)
+
+```
+γ nombre_comercial; SUM(saldo)→saldo_total (
+    σ estado='activo' (
+        clientes ⋈ id_cliente=id_cliente cuentas
+    )
+)
+```
+
+Tal como está escrita, la selección se aplica **después** de reunir las 720 filas de `clientes`
+con las 940 de `cuentas` — el join procesa cuentas que luego se van a descartar.
+
+### Transformación 1 — Ley 4/5 (selección sobre una reunión)
+
+`σp(E1 ⋈ E2) ≡ σp1(E1) ⋈ σp2(E2)`, si p1 usa solo atributos de E1 y p2 solo de E2.
+
+El predicado `estado='activo'` usa exclusivamente un atributo de `cuentas`, así que se empuja
+directo sobre esa relación, antes del join (heurística general: aplicar selecciones lo antes
+posible, hacia las hojas del árbol):
+
+```
+σ estado='activo' (clientes ⋈ cuentas)  ≡  clientes ⋈ σ estado='activo' (cuentas)
+```
+
+### Transformación 2 — Ley 9 (proyección sobre una reunión)
+
+`πx,y(E1 ⋈ E2) ≡ πx(E1) ⋈ πy(E2)`, si x ⊆ atributos(E1) y y ⊆ atributos(E2).
+
+La agregación solo necesita `nombre_comercial` de `clientes` y `saldo` de `cuentas` (más la
+clave de unión `id_cliente` en ambas, para poder reconstruir el join). Se proyecta cada relación
+a esas columnas antes de unir:
+
+```
+π nombre_comercial, id_cliente (clientes)  ⋈  π id_cliente, saldo (σ estado='activo' (cuentas))
+```
+
+### Expresión optimizada final
+
+```
+γ nombre_comercial; SUM(saldo)→saldo_total (
+    π nombre_comercial, id_cliente (clientes)
+    ⋈ id_cliente=id_cliente
+    π id_cliente, saldo (σ estado='activo' (cuentas))
+)
+```
+
+### Por qué es más barata — tuplas intermedias antes y después
+
+- **Antes de optimizar:** el join combina 940 cuentas (todas, sin filtrar) con sus clientes,
+  arrastrando las 16 columnas de `clientes` (incluida `contrasena`, de 60 bytes) y las 9 de
+  `cuentas` en cada tupla intermedia. Tamaño aproximado por tupla intermedia: `L_clientes +
+  L_cuentas = 305 + 91 = 396 bytes`. Total: `940 × 396 ≈ 372.240 bytes` antes de poder aplicar
+  el filtro y la agregación.
+- **Después de optimizar:** la selección reduce `cuentas` a solo las filas con `estado='activo'`
+  (≈ 85% del total en un sistema sano ≈ 800 filas) **antes** del join, y la proyección descarta
+  todo lo que no sea `id_cliente`, `nombre_comercial` o `saldo` — cada tupla intermedia pesa
+  apenas `16+25 ≈ 41 bytes` (lado clientes) u `16+8 = 24 bytes` (lado cuentas), en vez de 396.
+  Total aproximado: `800 × 24 ≈ 19.200 bytes` del lado de `cuentas`, un **~95% menos de datos**
+  movidos hacia la operación de join.
+
+  
+```sql
+SELECT c.nombre_comercial, SUM(cu.saldo) AS saldo_total
+FROM (SELECT id_cliente, nombre_comercial FROM clientes) AS c
+JOIN (SELECT id_cliente, saldo FROM cuentas WHERE estado = 'activo') AS cu
+  ON cu.id_cliente = c.id_cliente
+GROUP BY c.nombre_comercial;
+```
+
+El join optimizado procesa menos filas (las inactivas nunca llegan a unirse) y tuplas mucho más
+angostas (sin arrastrar columnas que la consulta no necesita) — menos I/O, menos comparaciones
+de join y menos memoria ocupada en cada paso.
