@@ -1,296 +1,135 @@
-Supuesto general: tamaño de página `P = 8192 bytes` (el valor por defecto de PostgreSQL, el
-motor real del proyecto).
-# Criterio 7 — Estrategia de almacenamiento e índices (tabla `cuentas`)
+# Analisis de tablas
+## Supuestos generales y fórmulas de referencia
 
-###  Organización de archivo
-
-`cuentas` se almacena como **heap** (montón, sin orden físico), que es la organización por
-defecto de PostgreSQL — no se usa `CLUSTER` sobre ninguna clave. Se justifica así porque la
-tabla se consulta sobre todo por dos vías distintas (`numero_cuenta` para operaciones puntuales,
-`id_cliente` para listar las cuentas de un comercio), y una organización clúster solo favorece
-una de las dos; es más flexible resolver ambos accesos con índices secundarios sobre un heap.
-
-###  Índices elegidos
-
-| Índice | Tipo | Justificación |
-|---|---|---|
-| `numero_cuenta` (UNIQUE) | B-tree, creado automáticamente por la restricción `UNIQUE` | Es el valor con el que el comercio consulta el estado de una cuenta puntual (`CuentaController`) — acceso por igualdad, selectivo al 100% (clave candidata) |
-| `idx_cuentas_cliente_estado` (`id_cliente, estado`) | B-tree compuesto | Resuelve "todas las cuentas activas de un comercio" (pregunta clave 8 del README) sin recorrer toda la tabla |
-
-La estimación cuantitativa completa (L, FR, BR y el árbol del índice) se desarrolla sobre
-`numero_cuenta`, por ser un caso más simple de ilustrar (clave candidata de un solo atributo).
-
-###  Estimación del tamaño de un registro (L)
-
-Columnas de `cuentas` (9 en total) clasificadas por tipo:
-
-| Columna | Tipo | Clasificación | Tamaño |
-|---|---|---|---|
-| `id_cuenta` | uuid | Fijo | 16 bytes |
-| `id_cliente` | uuid | Fijo | 16 bytes |
-| `numero_cuenta` | varchar(20) | Variable | ~10 bytes (contenido real: 10 dígitos, ver `GeneradorNumeroCuenta`) |
-| `estado` | varchar(30) | Variable | ~8 bytes (promedio entre `'activo'`, `'inactivo'`, `'bloqueado'`) |
-| `saldo` | numeric(19,2) | Fijo | 8 bytes |
-| `motivo` | varchar(200) | Variable | ~2 bytes (nulo en la gran mayoría de las filas: solo se llena si la cuenta se bloquea o suspende) |
-| `operaciones_suspendidas` | boolean | Fijo | 1 byte |
-| `fecha_vinculacion` | timestamptz | Fijo | 8 bytes |
-| `fecha_actualizacion` | timestamptz | Fijo | 8 bytes |
-
-- Σ tamaño(campos fijos) = 16+16+8+1+8+8 = **57 bytes**
-- #campos variables = 3 (`numero_cuenta`, `estado`, `motivo`) → 4·3 = **12 bytes** (descriptores de posición/longitud)
-- Σ tamaño estimado(campos variables) = 10+8+2 = **20 bytes**
-- Tamaño del mapa de bits (nulabilidad) = ⌈9 columnas / 8⌉ = **2 bytes**
-
-```
-L = 4·#var + Σ fijos + mapa_bits + Σ var_estimado
-L = 12 + 57 + 2 + 20 = 91 bytes
-```
-
-###  Registros por página (FR) y páginas de la tabla (BR)
-
-```
-P = 2 + 4·FR + FR·L  →  FR = ⌊(P − 2) / (4 + L)⌋
-FR = ⌊(8192 − 2) / (4 + 91)⌋ = ⌊8190 / 95⌋ = 86 registros/página
-```
-
-Usando la estimación de volumen de la sección 5 del README (`TR` inicial = 390, proyectado a 12
-meses = 940):
-
-```
-BR = ⌈TR / FR⌉
-BR_inicial = ⌈390 / 86⌉ = 5 páginas
-BR_12 meses = ⌈940 / 86⌉ = 11 páginas
-```
-
-`cuentas` es una tabla compacta: incluso a 12 meses, un recorrido secuencial completo tocaría
-solo 11 páginas. Igual se justifica el índice por el patrón de acceso (búsquedas puntuales
-frecuentes), no por el tamaño de la tabla.
-
-###  Estimación del índice sobre `numero_cuenta`
-
-Tamaño de una entrada del índice: clave (~10 dígitos + overhead ≈ 12 bytes) + puntero a la fila
-(≈ 8 bytes) = **L_entrada ≈ 20 bytes**.
-
-```
-FR_índice = ⌊B / L_entrada⌋ = ⌊8192 / 20⌋ = 409 entradas/nodo
-2d − 1 = FR_índice  →  d = (409 + 1) / 2 = 205   (cumple d ≥ 3)
-```
-
-**Altura (H):** como `numero_cuenta` es clave candidata, `V(numero_cuenta, cuentas) = TR = 940`
-(a 12 meses, todas distintas).
-
-```
-H ≤ log_d V(a,R) = log_205(940) ≈ 1.29  →  H = 2 (raíz + hojas)
-```
-
-**Nodos por nivel** (fórmula de referencia: `nodos del nivel k ≈ V(a,R) / d^k`, contando k=1 en
-las hojas hasta k=H en la raíz):
-
-```
-Nivel 1 (hojas): V / d^1 = 940 / 205 ≈ 4.59  →  5 nodos
-Nivel 2 (raíz):  V / d^2 = 940 / 205² ≈ 0.02 →  1 nodo
-Total: 5 + 1 = 6 nodos
-```
-
-**Espacio del índice:**
-
-```
-Espacio = nodos_totales × B = 6 × 8192 = 49.152 bytes ≈ 48 KB
-```
-
-Un índice de solo 2 niveles y 48 KB para resolver cualquier búsqueda por `numero_cuenta` en una
-sola lectura de hoja (más la raíz, que normalmente queda cacheada en memoria) — justifica
-sobradamente su costo de mantenimiento frente al beneficio en las operaciones de consulta de
-saldo, que son las más frecuentes del sistema.
+* **Motor y bloque:** PostgreSQL con tamaño de página $P = B = 8192\text{ bytes}$.
+* **Proyección de volumen (Mes 12):** `clientes` ($720$), `cuentas` ($940$), `transacciones` ($860.000\text{/mes}$), `eventos_transaccion` ($2.580.000\text{/mes}$, $3$ por transacción) y `retiros` ($172.000\text{/mes}$, $20\%$ del flujo transaccional).
+* **Fórmulas compactas:**
+  * **Registro y páginas:** $L = 4\#\text{var} + \sum\text{fijos} + \lceil\frac{\#\text{col}}{8}\rceil + \sum\text{var}_{\text{est}}$, $\quad F_R = \lfloor\frac{P-2}{4+L}\rfloor$, $\quad B_R = \lceil\frac{T_R}{F_R}\rceil$
+  * **Índice B-tree:** $F_{R\_\text{idx}} = \lfloor\frac{B}{L_{\text{ent}}}\rfloor$, $\quad d = \lfloor\frac{F_{R\_\text{idx}}+1}{2}\rfloor$, $\quad H \le \log_d V(a,R)$, $\quad \text{Espacio} = B\sum_{k=1}^{H}\lceil\frac{V(a,R)}{d^k}\rceil$
 
 ---
 
+## 1. Tabla `clientes` ($T_R = 720$)
 
-# Criterio 8 — Costo de una consulta con reunión (join)
+### Organización de archivo
+Se almacena como **heap** (montón sin orden físico). Es la estrategia más adecuada porque la tabla recibe actualizaciones frecuentes en campos de seguridad y auditoría (`intentos_fallidos`, `bloqueado_hasta`, `fecha_actualizacion`) y se consulta por múltiples llaves candidatas (`id_cliente`, `usuario`, `nit_documento`, `email`); un ordenamiento físico (`CLUSTER`) solo beneficiaría a una llave y penalizaría las escrituras.
 
-### Consulta analizada
+### Índices elegidos y estructura
 
-Responde la pregunta clave 8 del README ("¿cuál es el saldo total agregado por comercio,
-sumando sus cuentas activas?"):
-
-```sql
-SELECT c.nombre_comercial, SUM(cu.saldo) AS saldo_total
-FROM clientes c
-JOIN cuentas cu ON cu.id_cliente = c.id_cliente
-WHERE cu.estado = 'activo'
-GROUP BY c.nombre_comercial;
-```
-
-### Estadísticas usadas y su origen
-
-`cuentas` ya se calculó en el criterio 7. Para `clientes` se repite el mismo método 
-
-| Columna | Clasificación | Tamaño |
+| Índice | Tipo | Justificación |
 |---|---|---|
-| `id_cliente` | Fijo | 16 |
-| `fecha_registro` | Fijo | 8 |
-| `actualizado_por` | Fijo | 16 |
-| `fecha_actualizacion` | Fijo | 8 |
-| `intentos_fallidos` | Fijo | 4 |
-| `bloqueado_hasta` | Fijo | 8 |
-| `nombre_comercial`, `razon_social`, `nit_documento`, `email`, `usuario`, `contrasena`, `telefono`, `estado`, `rol`, `motivo` | Variables (10 campos) | 25+35+12+28+15+60+10+7+8+3 = 203 |
+| `clientes_pkey` (`id_cliente`) | B-tree (PK) | Resuelve joins con `cuentas`, `transacciones` y `retiros`, además de la auto-referencia `actualizado_por`. |
+| `clientes_usuario_key` (`usuario`) | B-tree (UNIQUE) | Acelera la búsqueda por igualdad en el inicio de sesión (`ClienteService`). |
+| `clientes_nit_documento_key` (`nit_documento`) | B-tree (UNIQUE) | Evita duplicados en el registro y permite consulta puntual por documento. |
+| `clientes_email_key` (`email`) | B-tree (UNIQUE) | Garantiza unicidad del correo electrónico sin recorridos secuenciales. |
 
-`contrasena` se estima en 60 bytes exactos porque BCrypt produce hashes de longitud fija
-(60 caracteres), no un valor arbitrario.
+* **Composición (16 columnas):** $6$ fijas (`id_cliente` $16\text{ B}$, `actualizado_por` $16\text{ B}$, `fecha_registro` $8\text{ B}$, `fecha_actualizacion` $8\text{ B}$, `bloqueado_hasta` $8\text{ B}$, `intentos_fallidos` $4\text{ B}$ $\rightarrow 60\text{ B}$) y $10$ variables (`contrasena` hash BCrypt fijo de $60\text{ B}$ + 9 textos estimados en $143\text{ B}$ $\rightarrow 203\text{ B}$).
 
-```
-Σ fijos = 16+8+16+8+4+8 = 60 bytes
-4·#var = 4·10 = 40 bytes
-mapa de bits = ⌈16 columnas / 8⌉ = 2 bytes
-L_clientes = 40 + 60 + 2 + 203 = 305 bytes
+### Estimación compacta (`clientes_nit_documento_key`, $V = 720$, $L_{\text{ent}} = 20\text{ B}$)
+* **Tabla:** $L = 4(10) + 60 + 2 + 203 = 305\text{ B} \implies F_R = \lfloor\frac{8190}{309}\rfloor = 26\text{ reg/pág} \implies B_R = \lceil\frac{720}{26}\rceil = 28\text{ págs}$ ($\approx 224\text{ KB}$).
+* **Índice:** $F_{R\_\text{idx}} = \lfloor\frac{8192}{20}\rfloor = 409 \implies d = 205 \implies H = \lceil\log_{205}(720)\rceil = 2$.
+* **Nodos y espacio:** $\text{Nodos} = \lceil\frac{720}{205}\rceil + \lceil\frac{720}{205^2}\rceil = 4 + 1 = 5\text{ nodos} \implies \text{Espacio} = 5 \times 8192 = 40\text{ KB}$.
 
-FR_clientes = ⌊(8192−2)/(4+305)⌋ = ⌊8190/309⌋ = 26 registros/página
-BR_clientes = ⌈720 / 26⌉ = 28 páginas   (TR=720, proyección a 12 meses, sección 5 del README)
-```
+---
 
-Resumen de estadísticas para el join:
+## 2. Tabla `cuentas` ($T_R = 940$)
 
-| Relación | TR (tuplas) | BR (páginas) |
+### Organización de archivo
+Se almacena como **heap** porque las operaciones del Sprint 3 (depósitos, retiros y transferencias) actualizan constantemente la columna `saldo`, además de los cambios de estado operativo (`bloquearCuenta`). El esquema heap junto con MVCC de PostgreSQL evita reorganizaciones costosas en disco y permite acceder eficientemente tanto por número de cuenta como por titular.
+
+### Índices elegidos y estructura
+
+| Índice | Tipo | Justificación |
 |---|---|---|
-| `clientes` (R) | 720 | 28 |
-| `cuentas` (S) | 940 | 11 |
+| `cuentas_pkey` (`id_cuenta`) | B-tree (PK) | Soporte para integridad referencial y bloqueos de fila (`FOR UPDATE`) en procedimientos almacenados. |
+| `cuentas_numero_cuenta_key` (`numero_cuenta`) | B-tree (UNIQUE) | Acceso puntual por igualdad (selectividad $100\%$) en consultas de saldo, depósitos, retiros y transferencias. |
+| `idx_cuentas_cliente_estado` (`id_cliente, estado`) | B-tree compuesto | Filtra las cuentas activas de un cliente sin escanear toda la tabla (validación de máximo 3 cuentas activas y saldos agregados). |
 
-Memoria disponible asumida: **M = 15 páginas** (buffer modesto, razonable para un servicio
-desplegado en el plan gratuito de Render, que comparte recursos con otros procesos).
+* **Composición (9 columnas):** $6$ fijas (`id_cuenta` $16\text{ B}$, `id_cliente` $16\text{ B}$, `saldo` $8\text{ B}$, `fecha_vinculacion` $8\text{ B}$, `fecha_actualizacion` $8\text{ B}$, `operaciones_suspendidas` $1\text{ B}$ $\rightarrow 57\text{ B}$) y $3$ variables (`numero_cuenta` $10\text{ B}$, `estado` $8\text{ B}$, `motivo` $2\text{ B}$ $\rightarrow 20\text{ B}$).
 
-### Fórmula aplicada y por qué
+### Estimación compacta (`cuentas_numero_cuenta_key`, $V = 940$, $L_{\text{ent}} = 20\text{ B}$)
+* **Tabla:** $L = 4(3) + 57 + 2 + 20 = 91\text{ B} \implies F_R = \lfloor\frac{8190}{95}\rfloor = 86\text{ reg/pág} \implies B_R = \lceil\frac{940}{86}\rceil = 11\text{ págs}$ ($\approx 88\text{ KB}$).
+* **Índice:** $F_{R\_\text{idx}} = \lfloor\frac{8192}{20}\rfloor = 409 \implies d = 205 \implies H = \lceil\log_{205}(940)\rceil = 2$.
+* **Nodos y espacio:** $\text{Nodos} = \lceil\frac{940}{205}\rceil + \lceil\frac{940}{205^2}\rceil = 5 + 1 = 6\text{ nodos} \implies \text{Espacio} = 6 \times 8192 = 48\text{ KB}$.
 
-El predicado de unión (`id_cliente`) no es selectivo por sí solo (no hay filtro de igualdad
-sobre un valor puntual), así que se evalúan las tres estrategias de reunión de la rúbrica para
-elegir la más barata: **nested-loop por bloques**, **nested-loop indexado** y **hash join**.
+---
 
-**1) Nested-loop por bloques** — `Costo = BR + BS · ⌈BR/(M−2)⌉` (conviene poner como relación
-externa la más pequeña en páginas):
+## 3. Tabla `transacciones` ($T_R = 860.000\text{/mes}$)
 
-```
-cuentas como externa:  BS + BR·⌈BS/(M−2)⌉ = 11 + 28·⌈11/13⌉ = 11 + 28·1 = 39 páginas
-clientes como externa: BR + BS·⌈BR/(M−2)⌉ = 28 + 11·⌈28/13⌉ = 28 + 11·3 = 61 páginas
-```
+### Organización de archivo
+Se almacena como **heap** con patrón predominantemente *append-only* (inserción continua). Dado que es la tabla transaccional de mayor movimiento monetario, mantenerla sin orden físico evita desplazamientos de bloques en inserciones concurrentes de depósitos, retiros y transferencias.
 
-Poner `cuentas` (la relación más pequeña) como externa reduce el costo de 61 a 39 páginas.
+### Índices elegidos y estructura
 
-**2) Nested-loop indexado** — `Costo = BT + TT · S(b,R)`, usando `cuentas` como relación
-externa (BT=11, TT=940) y sondeando el índice de la **clave primaria** de `clientes`:
+| Índice | Tipo | Justificación |
+|---|---|---|
+| `transacciones_pkey` (`id_transaccion`) | B-tree (PK) | Identificación única de cada operación y enlace con `eventos_transaccion`. |
+| `idx_transacciones_origen` (`id_cuenta_origen`) | B-tree | Recupera débitos, retiros y transferencias enviadas desde una cuenta en el estado de cuenta. |
+| `idx_transacciones_destino` (`id_cuenta_destino`) | B-tree | Recupera depósitos y transferencias recibidas por una cuenta. |
+| `idx_transacciones_cliente` (`id_cliente`) | B-tree | Filtra el historial de operaciones originadas por un cliente específico. |
+| `idx_transacciones_fecha` (`fecha_creacion`) | B-tree | Soporta consultas por rango temporal y extractos mensuales sin recorrido completo. |
+| `idx_transacciones_estado` (`estado`) | B-tree | Optimiza agregaciones y reportes por estado (`aprobado`, `rechazado`, `reembolsado`). |
 
-```
-S(id_cliente, clientes) = TR_clientes / V(id_cliente,clientes) = 720/720 = 1
-Costo = 11 + 940·1 = 951 páginas
-```
+* **Composición (10 columnas):** $8$ fijas (`id_transaccion` $16\text{ B}$, `id_cliente` $16\text{ B}$, `id_cuenta_origen` $16\text{ B}$, `id_cuenta_destino` $16\text{ B}$, `monto` $8\text{ B}$, `fecha_creacion` $8\text{ B}$, `fecha_actualizacion` $8\text{ B}$, `moneda` $3\text{ B}$ $\rightarrow 91\text{ B}$) y $2$ variables (`estado` $8\text{ B}$, `referencia_externa` $12\text{ B}$ $\rightarrow 20\text{ B}$).
 
-Sale caro porque el costo de este método depende del número de **tuplas** de la relación
-externa (940), no de sus páginas — y `cuentas` es una tabla "densa" (86 registros/página), así
-que hay muchas sondas de índice redundantes.
+### Estimación compacta (`idx_transacciones_fecha`, $V = 860.000$, $L_{\text{ent}} = 16\text{ B}$)
+* **Tabla:** $L = 4(2) + 91 + 2 + 20 = 121\text{ B} \implies F_R = \lfloor\frac{8190}{125}\rfloor = 65\text{ reg/pág} \implies B_R = \lceil\frac{860.000}{65}\rceil = 13.231\text{ págs}$ ($\approx 103,37\text{ MB}$).
+* **Índice:** $F_{R\_\text{idx}} = \lfloor\frac{8192}{16}\rfloor = 512 \implies d = 256 \implies H = \lceil\log_{256}(860.000)\rceil = 3$.
+* **Nodos y espacio:** $\text{Nodos} = \lceil\frac{860.000}{256}\rceil + \lceil\frac{860.000}{256^2}\rceil + 1 = 3.360 + 14 + 1 = 3.375\text{ nodos} \implies \text{Espacio} = 3.375 \times 8192 \approx 26,37\text{ MB}$.
 
-**3) Hash join (en memoria)** — `Costo = BR + BS` (válido porque M=15 páginas alcanza para
-construir la tabla hash de la relación más pequeña, `cuentas`, con 11 páginas):
+---
 
-```
-Costo = 28 + 11 = 39 páginas
-```
+## 4. Tabla `eventos_transaccion` ($T_R = 2.580.000\text{/mes}$)
 
-### Comparación y conclusión
+### Organización de archivo
+Se almacena como **heap** estrictamente inmutable (`INSERT`-only, con `UPDATE` y `DELETE` revocados a la aplicación). Como registra cada evento de auditoría (depósito, retiro, transferencia y cambios de estado), el almacenamiento secuencial al final del archivo elimina por completo la fragmentación por actualizaciones.
 
-| Estrategia | Costo (páginas de E/S) |
-|---|---|
-| Nested-loop por bloques (`cuentas` externa) | 39 |
-| Nested-loop por bloques (`clientes` externa) | 61 |
-| Nested-loop indexado | 951 |
-| **Hash join** | **39** |
+### Índices elegidos y estructura
 
-El **hash join es la elección recomendada**: su costo no depende de cómo se ordene R y S, es
-estable frente al crecimiento de ambas tablas, y es, de hecho, la estrategia que el planificador
-de PostgreSQL elegiría en la práctica para una reunión por igualdad sin un filtro selectivo de
-por medio.
+| Índice | Tipo | Justificación |
+|---|---|---|
+| `eventos_transaccion_pkey` (`id_evento`) | B-tree (PK) | Llave primaria autoincremental (`IDENTITY`) con inserciones ordenadas en el extremo derecho del árbol. |
+| `idx_eventos_transaccion_id` (`id_transaccion, fecha_evento`) | B-tree compuesto | Permite reconstruir la trazabilidad cronológica completa de una transacción en una sola lectura de rango. |
 
+* **Composición (7 columnas):** $3$ fijas (`id_transaccion` $16\text{ B}$, `id_evento` $8\text{ B}$, `fecha_evento` $8\text{ B}$ $\rightarrow 32\text{ B}$) y $4$ variables (`tipo_evento` $12\text{ B}$, `estado_anterior` $4\text{ B}$, `estado_nuevo` $8\text{ B}$, `detalle` $35\text{ B}$ $\rightarrow 59\text{ B}$).
 
+### Estimación compacta (`idx_eventos_transaccion_id`, $V = 2.580.000$, $L_{\text{ent}} = 32\text{ B}$)
+* **Tabla:** $L = 4(4) + 32 + 1 + 59 = 108\text{ B} \implies F_R = \lfloor\frac{8190}{112}\rfloor = 73\text{ reg/pág} \implies B_R = \lceil\frac{2.580.000}{73}\rceil = 35.343\text{ págs}$ ($\approx 276,12\text{ MB}$).
+* **Índice:** $F_{R\_\text{idx}} = \lfloor\frac{8192}{32}\rfloor = 256 \implies d = 128 \implies H = \lceil\log_{128}(2.580.000)\rceil = 4$.
+* **Nodos y espacio:** $\text{Nodos} = \lceil\frac{2.580.000}{128}\rceil + \lceil\frac{2.580.000}{128^2}\rceil + \lceil\frac{2.580.000}{128^3}\rceil + 1 = 20.157 + 158 + 2 + 1 = 20.318\text{ nodos} \implies \text{Espacio} \approx 158,73\text{ MB}$.
 
-# Criterio 9 — Optimización algebraica de la misma consulta
+---
 
-### SQL original
+## 5. Tabla `retiros` ($T_R = 172.000\text{/mes}$)
 
-```sql
-SELECT c.nombre_comercial, SUM(cu.saldo) AS saldo_total
-FROM clientes c
-JOIN cuentas cu ON cu.id_cliente = c.id_cliente
-WHERE cu.estado = 'activo'
-GROUP BY c.nombre_comercial;
-```
+### Organización de archivo
+Se almacena como **heap** de registros inmutables y de longitud fija ($0$ columnas variables). Esto garantiza un empaquetamiento máximo por bloque sin desperdicio por descriptores variables ni reubicación de tuplas tras la inserción del retiro.
 
-### Expresión algebraica inicial (traducción literal del SQL)
+### Índices elegidos y estructura
 
-```
-γ nombre_comercial; SUM(saldo)→saldo_total (
-    σ estado='activo' (
-        clientes ⋈ id_cliente=id_cliente cuentas
-    )
-)
-```
+| Índice | Tipo | Justificación |
+|---|---|---|
+| `retiros_pkey` (`id_retiro`) | B-tree (PK) | Identificador único del comprobante de retiro. |
+| `idx_retiros_cuenta` (`id_cuenta, fecha`) | B-tree compuesto | Consulta rápida del historial de retiros efectuados sobre una cuenta ordenados por fecha. |
+| `idx_retiros_cliente` (`id_cliente, fecha`) | B-tree compuesto | Audita todos los retiros realizados por un cliente sobre sus cuentas propias. |
 
-Tal como está escrita, la selección se aplica **después** de reunir las 720 filas de `clientes`
-con las 940 de `cuentas` — el join procesa cuentas que luego se van a descartar.
+* **Composición (5 columnas):** $5$ fijas (`id_retiro` $16\text{ B}$, `id_cliente` $16\text{ B}$, `id_cuenta` $16\text{ B}$, `monto` $8\text{ B}$, `fecha` $8\text{ B}$ $\rightarrow 64\text{ B}$) y $0$ variables.
 
-### Transformación 1 — Ley 4/5 (selección sobre una reunión)
+### Estimación compacta (`idx_retiros_cuenta`, $V = 172.000$, $L_{\text{ent}} = 32\text{ B}$)
+* **Tabla:** $L = 0 + 64 + 1 + 0 = 65\text{ B} \implies F_R = \lfloor\frac{8190}{69}\rfloor = 118\text{ reg/pág} \implies B_R = \lceil\frac{172.000}{118}\rceil = 1.458\text{ págs}$ ($\approx 11,39\text{ MB}$).
+* **Índice:** $F_{R\_\text{idx}} = \lfloor\frac{8192}{32}\rfloor = 256 \implies d = 128 \implies H = \lceil\log_{128}(172.000)\rceil = 3$.
+* **Nodos y espacio:** $\text{Nodos} = \lceil\frac{172.000}{128}\rceil + \lceil\frac{172.000}{128^2}\rceil + 1 = 1.344 + 11 + 1 = 1.356\text{ nodos} \implies \text{Espacio} \approx 10,59\text{ MB}$.
 
-`σp(E1 ⋈ E2) ≡ σp1(E1) ⋈ σp2(E2)`, si p1 usa solo atributos de E1 y p2 solo de E2.
+---
 
-El predicado `estado='activo'` usa exclusivamente un atributo de `cuentas`, así que se empuja
-directo sobre esa relación, antes del join (heurística general: aplicar selecciones lo antes
-posible, hacia las hojas del árbol):
+## Resumen comparativo (Proyección Mes 12)
 
-```
-σ estado='activo' (clientes ⋈ cuentas)  ≡  clientes ⋈ σ estado='activo' (cuentas)
-```
+| Tabla | $T_R$ | $L$ | $F_R$ | $B_R$ | Tamaño tabla | Índice evaluado | $d$ | $H$ | Tamaño índice |
+|---|---|---|---|---|---|---|---|---|---|
+| `clientes` | $720$ | $305\text{ B}$ | $26$ | $28$ | $224\text{ KB}$ | `clientes_nit_documento_key` | $205$ | $2$ | $40\text{ KB}$ |
+| `cuentas` | $940$ | $91\text{ B}$ | $86$ | $11$ | $88\text{ KB}$ | `cuentas_numero_cuenta_key` | $205$ | $2$ | $48\text{ KB}$ |
+| `transacciones` | $860.000$ | $121\text{ B}$ | $65$ | $13.231$ | $103,37\text{ MB}$ | `idx_transacciones_fecha` | $256$ | $3$ | $26,37\text{ MB}$ |
+| `eventos_transaccion` | $2.580.000$ | $108\text{ B}$ | $73$ | $35.343$ | $276,12\text{ MB}$ | `idx_eventos_transaccion_id` | $128$ | $4$ | $158,73\text{ MB}$ |
+| `retiros` | $172.000$ | $65\text{ B}$ | $118$ | $1.458$ | $11,39\text{ MB}$ | `idx_retiros_cuenta` | $128$ | $3$ | $10,59\text{ MB}$ |
 
-### Transformación 2 — Ley 9 (proyección sobre una reunión)
-
-`πx,y(E1 ⋈ E2) ≡ πx(E1) ⋈ πy(E2)`, si x ⊆ atributos(E1) y y ⊆ atributos(E2).
-
-La agregación solo necesita `nombre_comercial` de `clientes` y `saldo` de `cuentas` (más la
-clave de unión `id_cliente` en ambas, para poder reconstruir el join). Se proyecta cada relación
-a esas columnas antes de unir:
-
-```
-π nombre_comercial, id_cliente (clientes)  ⋈  π id_cliente, saldo (σ estado='activo' (cuentas))
-```
-
-### Expresión optimizada final
-
-```
-γ nombre_comercial; SUM(saldo)→saldo_total (
-    π nombre_comercial, id_cliente (clientes)
-    ⋈ id_cliente=id_cliente
-    π id_cliente, saldo (σ estado='activo' (cuentas))
-)
-```
-
-### Por qué es más barata — tuplas intermedias antes y después
-
-- **Antes de optimizar:** el join combina 940 cuentas (todas, sin filtrar) con sus clientes,
-  arrastrando las 16 columnas de `clientes` (incluida `contrasena`, de 60 bytes) y las 9 de
-  `cuentas` en cada tupla intermedia. Tamaño aproximado por tupla intermedia: `L_clientes +
-  L_cuentas = 305 + 91 = 396 bytes`. Total: `940 × 396 ≈ 372.240 bytes` antes de poder aplicar
-  el filtro y la agregación.
-- **Después de optimizar:** la selección reduce `cuentas` a solo las filas con `estado='activo'`
-  (≈ 85% del total en un sistema sano ≈ 800 filas) **antes** del join, y la proyección descarta
-  todo lo que no sea `id_cliente`, `nombre_comercial` o `saldo` — cada tupla intermedia pesa
-  apenas `16+25 ≈ 41 bytes` (lado clientes) u `16+8 = 24 bytes` (lado cuentas), en vez de 396.
-  Total aproximado: `800 × 24 ≈ 19.200 bytes` del lado de `cuentas`, un **~95% menos de datos**
-  movidos hacia la operación de join.
-
-  
-```sql
-SELECT c.nombre_comercial, SUM(cu.saldo) AS saldo_total
-FROM (SELECT id_cliente, nombre_comercial FROM clientes) AS c
-JOIN (SELECT id_cliente, saldo FROM cuentas WHERE estado = 'activo') AS cu
-  ON cu.id_cliente = c.id_cliente
-GROUP BY c.nombre_comercial;
-```
-
-El join optimizado procesa menos filas (las inactivas nunca llegan a unirse) y tuplas mucho más
-angostas (sin arrastrar columnas que la consulta no necesita) — menos I/O, menos comparaciones
-de join y menos memoria ocupada en cada paso.
+# Analisis hecho con Claude y revisadas las formulas con calculadora, todas están bien
