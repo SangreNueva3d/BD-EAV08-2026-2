@@ -206,7 +206,7 @@ Restricción a nivel de tabla: `CHECK (id_cuenta_origen IS DISTINCT FROM id_cuen
 
 # Criterio 3 - Triggers coherentes con las HU
 
-Los siguientes triggers están implementados en [`schema.sql`](./schema.sql) para blindar las reglas de negocio directamente en PostgreSQL/Supabase:
+Los siguientes triggers están implementados en [`schema.sql`](./schema.sql) para blindar las reglas de negocio directamente en PostgreSQL:
 
 | Trigger | Tabla | Momento y Evento | HU que atiende | Propósito |
 |---|---|---|---|---|
@@ -273,7 +273,162 @@ Los siguientes procedimientos almacenados en [`schema.sql`](./schema.sql) encaps
   );
   ```
 ---
+# Criterio 5 - Consultas actualizadas (Sprints 1, 2 y 3)
 
+### Consultas de Sprints 1 y 2 ajustadas al esquema refinado
+
+```sql
+-- 1. [Sprint 1 - HU: Consultar actividad/clientes] Top 10 clientes con mayor volumen de transacciones aprobadas en el último mes
+SELECT c.id_cliente, c.nombre_comercial, SUM(t.monto) AS volumen_aprobado
+FROM transacciones t
+JOIN clientes c ON c.id_cliente = t.id_cliente
+WHERE t.estado = 'aprobado'
+  AND t.fecha_creacion >= date_trunc('month', now()) - interval '1 month'
+  AND t.fecha_creacion <  date_trunc('month', now())
+GROUP BY c.id_cliente, c.nombre_comercial
+ORDER BY volumen_aprobado DESC
+LIMIT 10;
+
+-- 2. [Sprint 1 - HU: Restringir acciones según rol / Auditoría] Administradores por número de cambios realizados sobre perfiles de clientes
+SELECT admin.nombre_comercial AS administrador, COUNT(*) AS cambios_realizados
+FROM clientes afectado
+JOIN clientes admin ON admin.id_cliente = afectado.actualizado_por
+GROUP BY admin.nombre_comercial
+ORDER BY cambios_realizados DESC;
+
+-- 3. [Sprint 2 - HU: Autenticarse en el sistema] Clientes bloqueados temporalmente por intentos fallidos de inicio de sesión
+SELECT id_cliente, usuario, nombre_comercial, intentos_fallidos, bloqueado_hasta
+FROM clientes
+WHERE bloqueado_hasta IS NOT NULL
+  AND bloqueado_hasta > now();
+
+-- 4. [Sprint 2 - HU: Consultar saldo disponible] Saldo total disponible por cliente sumando sus cuentas activas
+SELECT c.id_cliente, c.nombre_comercial, COUNT(cu.id_cuenta) AS cuentas_activas, SUM(cu.saldo) AS saldo_total
+FROM clientes c
+JOIN cuentas cu ON cu.id_cliente = c.id_cliente
+WHERE cu.estado = 'activo'
+  AND cu.operaciones_suspendidas = FALSE
+GROUP BY c.id_cliente, c.nombre_comercial
+ORDER BY saldo_total DESC;
+
+-- 5. [Sprint 2 - HU: Bloquear cuenta financiera] Cuentas bloqueadas o con operaciones suspendidas y su motivo
+SELECT cu.numero_cuenta, c.nombre_comercial, cu.estado, cu.operaciones_suspendidas, cu.motivo, cu.fecha_actualizacion
+FROM cuentas cu
+JOIN clientes c ON c.id_cliente = cu.id_cliente
+WHERE cu.estado = 'bloqueado' OR cu.operaciones_suspendidas = TRUE;
+
+-- 6. [Sprint 2 - HU: Consultar estado de cuenta financiera] Estado actual y resumen de movimientos de una cuenta específica
+SELECT cu.numero_cuenta,
+       c.nombre_comercial AS titular,
+       cu.estado,
+       cu.saldo AS saldo_disponible,
+       COUNT(t.id_transaccion) AS total_movimientos
+FROM cuentas cu
+JOIN clientes c ON c.id_cliente = cu.id_cliente
+LEFT JOIN transacciones t
+       ON t.id_cuenta_origen = cu.id_cuenta OR t.id_cuenta_destino = cu.id_cuenta
+WHERE cu.numero_cuenta = '1000000001'
+GROUP BY cu.numero_cuenta, c.nombre_comercial, cu.estado, cu.saldo;
+```
+
+### Consultas nuevas del Sprint 3
+
+```sql
+-- 7. [Sprint 3 - HU: Retirar dinero solo desde una cuenta propia / Retirar dinero de una cuenta propia]
+-- Historial de retiros realizados por un cliente sobre sus cuentas propias
+SELECT r.id_retiro,
+       c.nombre_comercial AS titular,
+       cu.numero_cuenta,
+       r.monto,
+       r.fecha
+FROM retiros r
+JOIN clientes c ON c.id_cliente = r.id_cliente
+JOIN cuentas cu ON cu.id_cuenta = r.id_cuenta
+WHERE r.id_cliente = '11111111-1111-1111-1111-111111111111'
+ORDER BY r.fecha DESC;
+
+-- 8. [Sprint 3 - HU: Depositar dinero en una cuenta del banco]
+-- Listado de depósitos aprobados recibidos por una cuenta con su constancia de auditoría
+SELECT t.id_transaccion,
+       cu_dest.numero_cuenta AS cuenta_destino,
+       c_orig.nombre_comercial AS depositante,
+       t.monto,
+       t.moneda,
+       e.detalle AS constancia,
+       t.fecha_creacion
+FROM transacciones t
+JOIN cuentas cu_dest ON cu_dest.id_cuenta = t.id_cuenta_destino
+JOIN clientes c_orig ON c_orig.id_cliente = t.id_cliente
+LEFT JOIN eventos_transaccion e
+       ON e.id_transaccion = t.id_transaccion AND e.tipo_evento = 'deposito'
+WHERE t.id_cuenta_origen IS NULL
+  AND t.id_cuenta_destino IS NOT NULL
+  AND t.estado = 'aprobado'
+ORDER BY t.fecha_creacion DESC;
+
+-- 9. [Sprint 3 - HU: Transferir dinero a otra cuenta del mismo banco / Enviar dinero solo desde una cuenta propia]
+-- Historial de transferencias entre cuentas del banco con identificación de cuenta origen y cuenta destino
+SELECT t.id_transaccion,
+       c.nombre_comercial AS ordenante,
+       cu_orig.numero_cuenta AS cuenta_origen,
+       cu_dest.numero_cuenta AS cuenta_destino,
+       t.monto,
+       t.moneda,
+       t.estado,
+       t.referencia_externa,
+       t.fecha_creacion
+FROM transacciones t
+JOIN clientes c ON c.id_cliente = t.id_cliente
+JOIN cuentas cu_orig ON cu_orig.id_cuenta = t.id_cuenta_origen
+JOIN cuentas cu_dest ON cu_dest.id_cuenta = t.id_cuenta_destino
+WHERE t.id_cuenta_origen IS NOT NULL
+  AND t.id_cuenta_destino IS NOT NULL
+ORDER BY t.fecha_creacion DESC;
+
+-- 10. [Sprint 3 - HU: Consultar extracto unificado de depósitos, retiros y transferencias por cuenta]
+-- Extracto cronológico de entradas y salidas de una cuenta financiera
+SELECT t.id_transaccion,
+       t.fecha_creacion,
+       CASE
+           WHEN t.id_cuenta_origen IS NULL AND t.id_cuenta_destino = cu.id_cuenta THEN 'DEPOSITO'
+           WHEN t.id_cuenta_destino IS NULL AND t.id_cuenta_origen = cu.id_cuenta THEN 'RETIRO'
+           WHEN t.id_cuenta_origen = cu.id_cuenta THEN 'TRANSFERENCIA_ENVIADA'
+           ELSE 'TRANSFERENCIA_RECIBIDA'
+       END AS tipo_operacion,
+       CASE
+           WHEN t.id_cuenta_destino = cu.id_cuenta THEN t.monto
+           ELSE -t.monto
+       END AS impacto_saldo,
+       t.estado
+FROM transacciones t
+JOIN cuentas cu ON cu.id_cuenta IN (t.id_cuenta_origen, t.id_cuenta_destino)
+WHERE cu.numero_cuenta = '1000000001'
+ORDER BY t.fecha_creacion DESC;
+```
+
+---
+# Criterio 6 - Roles y esquema de seguridad actualizados
+
+Siguiendo el **principio de mínimo privilegio**, se mantienen los tres roles de motor (`rol_admin`, `rol_app`, `rol_lectura`) y se actualizan sus privilegios respecto al Sprint 2 para cubrir la nueva tabla `retiros` y los tres procedimientos almacenados (`sp_depositar_dinero`, `sp_retirar_dinero`, `sp_transferir_dinero`).
+
+### Cambios en seguridad frente al Sprint 2
+- **Tabla `retiros`:** Se otorga `SELECT, INSERT` a `rol_app` (sin `UPDATE` ni `DELETE` para preservar la inmutabilidad del registro de retiros), `SELECT` a `rol_lectura` y `ALL` a `rol_admin`.
+- **Procedimientos almacenados (`EXECUTE`):** Se revoca `EXECUTE` a `PUBLIC` y se otorga `EXECUTE` exclusivamente a `rol_app` y `rol_admin` sobre `sp_depositar_dinero`, `sp_retirar_dinero` y `sp_transferir_dinero`. `rol_lectura` no tiene permiso de ejecución sobre operaciones monetarias.
+
+### Matriz actualizada rol × objeto
+
+| Objeto / Tabla | `rol_admin` | `rol_app` | `rol_lectura` |
+|---|---|---|---|
+| `clientes` | `ALL` | `SELECT, INSERT, UPDATE` | `SELECT` |
+| `cuentas` | `ALL` | `SELECT, INSERT, UPDATE` | `SELECT` |
+| `transacciones` | `ALL` | `SELECT, INSERT, UPDATE` | `SELECT` |
+| `eventos_transaccion` | `ALL` | `SELECT, INSERT` *(inmutable: sin UPDATE/DELETE)* | `SELECT` |
+| `retiros` *(Nuevo Sprint 3)* | `ALL` | `SELECT, INSERT` *(inmutable: sin UPDATE/DELETE)* | `SELECT` |
+| `sp_depositar_dinero` *(Nuevo Sprint 3)* | `EXECUTE` | `EXECUTE` | — |
+| `sp_retirar_dinero` *(Nuevo Sprint 3)* | `EXECUTE` | `EXECUTE` | — |
+| `sp_transferir_dinero` *(Nuevo Sprint 3)* | `EXECUTE` | `EXECUTE` | — |
+
+### Análisis de tablas en AnalisisAlmacenamiento.md
 
 3 Versión
 
